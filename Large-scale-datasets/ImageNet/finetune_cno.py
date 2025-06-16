@@ -1,0 +1,459 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.backends.cudnn as cudnn
+import torchvision
+import torchvision.transforms as transforms
+import os
+import time
+import argparse
+import random
+import copy # For deep copying models and states
+# from timm.models.vision_transformer import VisionTransformer
+import torchvision.models as models
+
+
+# -------------------- CNO & Script Parameters --------------------
+parser = argparse.ArgumentParser(description='PyTorch CIFAR-100 Fine-tuning with CNO on Weights')
+# --- CNO Parameters (Mapping from image) ---
+parser.add_argument('--num_particles', default=2, type=int, help='Number of particles (N)')
+parser.add_argument('--cno_epochs', default=10, type=int, help='Number of CNO iterations (κ_max)')
+parser.add_argument('--w', default=1, type=float, help='Inertia weight (ω)')
+parser.add_argument('--c1', default=0.00001, type=float, help='Cognitive learning factor (c1)')
+parser.add_argument('--c2', default=0.00001, type=float, help='Social learning factor (c2)')
+parser.add_argument('--eta', default=0.0001, type=float, help='Scale factor / Learning rate for inner SGD step (η)') # Map eta to SGD LR
+# --- Parameters consistent with PSO/SAM for comparison ---
+parser.add_argument('--initial_noise_level', default=0.0001, type=float, help='Std deviation of noise added to initial particle weights')
+parser.add_argument('--inner_sgd_momentum', default=0, type=float, help='Momentum for the inner SGD step')
+parser.add_argument('--inner_sgd_wd', default=5e-4, type=float, help='Weight decay for the inner SGD step')
+parser.add_argument('--arch', default='vit-t', type=str)
+parser.add_argument('--load_path', default='./vit-t_cifar100_final_290.pth', type=str, help='Path to load the pre-trained model')
+parser.add_argument('--save_path', default='./vit-t_cifar100_cno_ft_290.pth', type=str, help='Path to save the best model found by CNO')
+parser.add_argument('--batch_size', default=128, type=int, help='Batch size for SGD training and evaluation')
+parser.add_argument('--data_path', default='/scratch/lab415/datasets/imagenet/', type=str, help='Path to dataset')
+# --- Use parse_known_args() for Jupyter compatibility ---
+args, unknown = parser.parse_known_args()
+
+print(args)
+
+
+
+# -------------------- Device Configuration --------------------
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
+if device == 'cuda':
+    cudnn.benchmark = True
+
+# -------------------- 数据准备 --------------------
+print('==> Preparing data..')
+# ImageNet normalization
+imagenet_mean = [0.485, 0.456, 0.406]
+imagenet_std = [0.229, 0.224, 0.225]
+
+transform_train = transforms.Compose([
+    transforms.RandomResizedCrop(224), # Standard for ImageNet
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(imagenet_mean, imagenet_std),
+])
+
+transform_test = transforms.Compose([
+    transforms.Resize(256), # Standard for ImageNet
+    transforms.CenterCrop(224), # Standard for ImageNet
+    transforms.ToTensor(),
+    transforms.Normalize(imagenet_mean, imagenet_std),
+])
+
+# Ensure your ImageNet data is structured as:
+# args.data_path/train/class1/img1.jpeg
+# args.data_path/train/class2/img2.jpeg
+# ...
+# args.data_path/val/class1/img3.jpeg
+# args.data_path/val/class2/img4.jpeg
+# ...
+train_dir = os.path.join(args.data_path, 'train')
+val_dir = os.path.join(args.data_path, 'val') # Or 'validation' or 'test' depending on your ImageNet structure
+
+if not os.path.isdir(train_dir) or not os.path.isdir(val_dir):
+    raise FileNotFoundError(f"ImageNet train or val directory not found at {args.data_path}. Please check the path and structure.")
+
+trainset = torchvision.datasets.ImageFolder(
+    root=train_dir, transform=transform_train)
+trainloader = torch.utils.data.DataLoader(
+    trainset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True) # Increased num_workers, added pin_memory
+
+testset = torchvision.datasets.ImageFolder(
+    root=val_dir, transform=transform_test)
+testloader = torch.utils.data.DataLoader(
+    testset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True) # Increased num_workers, added pin_memory
+
+# -------------------- Loss Function --------------------
+criterion = nn.CrossEntropyLoss()
+
+# -------------------- Helper Functions --------------------
+
+# Standard evaluation function (for final results)
+def evaluate(loader, model, set_name="Test"):
+    model.eval()
+    eval_loss = 0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(loader):
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            eval_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+    avg_loss = eval_loss / len(loader)
+    accuracy = 100. * correct / total
+    print(f'{set_name.ljust(5)} Eval | Loss: {avg_loss:.4f} | Acc: {accuracy:.3f}% ({correct}/{total})')
+    return avg_loss, accuracy
+
+# Function for CNO Line 7: Train ONE SGD epoch and return the *new state* and the loss
+def train_one_sgd_epoch_and_get_state(initial_state_dict, train_loader, criterion, device, lr, momentum, weight_decay):
+    # Create a temporary model instance for this SGD step
+    # model = ResNet20().to(device)
+    if args.arch == 'r18':
+        model = models.resnet18(pretrained=False, num_classes=1000).to(device)
+    if args.arch == 'r34':
+        model = models.resnet34(pretrained=False, num_classes=1000).to(device)
+    if args.arch == 'r50':
+        model = models.resnet50(pretrained=False, num_classes=1000).to(device)
+    model.load_state_dict(copy.deepcopy(initial_state_dict)) # Load initial state
+    model.train()
+    train_loss = 0
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+    start_time = time.time()
+    print(f"      Starting 1-epoch SGD (CNO Line 7, η={lr})... ", end="")
+    for batch_idx, (inputs, targets) in enumerate(train_loader):
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item()
+    avg_loss = train_loss / len(train_loader)
+    epoch_time = time.time() - start_time
+    print(f"Done. Avg Loss during SGD: {avg_loss:.4f} | Time: {epoch_time:.2f}s")
+    # Return the state *after* SGD and the loss calculated *during* SGD
+    return copy.deepcopy(model.state_dict()), avg_loss
+
+# Function for CNO Line 10: Evaluate fitness (loss) on train set *without* training
+def evaluate_fitness_loss(current_state_dict, train_loader, criterion, device):
+    # model = ResNet20().to(device) # Temporary model
+    if args.arch == 'r18':
+        model = models.resnet18(pretrained=False, num_classes=1000).to(device)
+    if args.arch == 'r34':
+        model = models.resnet34(pretrained=False, num_classes=1000).to(device)
+    if args.arch == 'r50':
+        model = models.resnet50(pretrained=False, num_classes=1000).to(device)
+    model.load_state_dict(copy.deepcopy(current_state_dict))
+    model.eval() # Use eval mode for consistent loss calculation
+    total_loss = 0
+    num_batches = 0
+    print(f"      Evaluating fitness (CNO Line 10)... ", end="")
+    start_time = time.time()
+    with torch.no_grad():
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            total_loss += loss.item()
+            num_batches += 1
+    avg_loss = total_loss / num_batches
+    eval_time = time.time() - start_time
+    print(f"Done. Fitness (Avg Train Loss): {avg_loss:.4f} | Time: {eval_time:.2f}s")
+    return avg_loss
+
+# Function to add noise to model parameters
+def add_noise_to_model(model, noise_level, device):
+    with torch.no_grad():
+        for param in model.parameters():
+            noise = torch.randn_like(param) * noise_level
+            param.add_(noise.to(device))
+    return model
+
+# Function to initialize particle velocity
+def initialize_velocity(model):
+    velocity = {}
+    with torch.no_grad():
+      for name, param in model.named_parameters():
+          if param.requires_grad:
+              velocity[name] = torch.zeros_like(param)
+    return velocity
+
+# Function for CNO Line 8: Update particle velocity
+def update_cno_velocity(velocity_dict, z_bar_i_state, pbest_state, gbest_state, w, c1, c2, device):
+    with torch.no_grad():
+        for name, param_vel in velocity_dict.items():
+            if name not in z_i_state: continue # Skip if param not in state (e.g., buffer)
+
+            r1 = random.random()
+            r2 = random.random()
+
+            # Ensure all tensors are on the correct device
+            z_bar_i_param = z_bar_i_state[name].to(device)
+            pbest_param = pbest_state[name].to(device)
+            gbest_param = gbest_state[name].to(device)
+            current_vel = param_vel.to(device)
+
+            # CNO Velocity Update (Line 8)
+            cognitive_term = c1 * r1 * (pbest_param - z_bar_i_param)
+            social_term = c2 * r2 * (gbest_param - z_bar_i_param)
+
+            new_vel = cognitive_term + social_term
+            velocity_dict[name].copy_(new_vel) # Update velocity in place
+
+# Function for CNO Line 9: Update particle position based on velocity
+# Takes the state *before* SGD (z_i) and adds the *newly computed* velocity
+def update_particle_position(model_to_update, z_bar_i_state, velocity_dict, device):
+    new_state = copy.deepcopy(z_bar_i_state) # Start from state before SGD
+    with torch.no_grad():
+        for name, param in new_state.items():
+             if name in velocity_dict:
+                 param.add_(velocity_dict[name].to(device)) # Add velocity: z_i + v_i
+    model_to_update.load_state_dict(new_state) # Load the final updated state into the particle's model
+
+
+# -------------------- Load Pre-trained Model --------------------
+print('==> Loading pre-trained model...')
+# initial_model = ResNet20().to(device)
+if args.arch == 'r18':
+    initial_model = models.resnet18(pretrained=False, num_classes=1000).to(device)
+if args.arch == 'r34':
+    initial_model = models.resnet34(pretrained=False, num_classes=1000).to(device)
+if args.arch == 'r50':
+    initial_model = models.resnet50(pretrained=False, num_classes=1000).to(device)
+
+
+if os.path.exists(args.load_path):
+    try:
+        checkpoint = torch.load(args.load_path, map_location=device)
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint: initial_model.load_state_dict(checkpoint['state_dict'])
+        elif isinstance(checkpoint, dict): initial_model.load_state_dict(checkpoint)
+        else: initial_model = checkpoint
+        print(f"Loaded pre-trained weights from '{args.load_path}'")
+    except Exception as e: print(f"Error loading checkpoint: {e}. Exiting."); exit()
+else: print(f"Pre-trained model file not found at '{args.load_path}'. Exiting."); exit()
+
+# Evaluate the loaded model once (using standard evaluate)
+print("\n==> Evaluating loaded pre-trained model:")
+initial_test_loss, initial_test_acc = evaluate(testloader, initial_model, "Test")
+# We need initial train loss for comparison, evaluate it here
+initial_train_loss, initial_train_acc = evaluate(trainloader, initial_model, "Train")
+
+
+# -------------------- CNO Initialization --------------------
+print(f"\n==> Initializing {args.num_particles} CNO particles...")
+particles = []
+gbest_state_dict = None # Will be set after initial eval
+gbest_fitness = float('inf')
+
+for i in range(args.num_particles):
+    print(f"  Initializing particle {i+1}/{args.num_particles}...")
+    particle_model = copy.deepcopy(initial_model).to(device)
+    if i > 0 or args.num_particles == 1: # Add noise to copies
+         particle_model = add_noise_to_model(particle_model, args.initial_noise_level, device)
+
+    velocity = initialize_velocity(particle_model)
+    pbest_state_dict = copy.deepcopy(particle_model.state_dict()) # Initial pbest is initial state
+    pbest_fitness = float('inf') # Will be set by initial eval
+
+    particles.append({
+        'id': i,
+        'model': particle_model, # Holds the current position z_i
+        'velocity': velocity,
+        'pbest_state_dict': pbest_state_dict,
+        'pbest_fitness': pbest_fitness,
+        'current_fitness': float('inf')
+    })
+
+# --- Initial Fitness Evaluation (Crucial for CNO/PSO) ---
+print("\n==> Performing initial fitness evaluation (using evaluate_fitness_loss)...")
+current_epoch_best_fitness = float('inf')
+current_epoch_best_particle_idx = -1
+
+for i, particle in enumerate(particles):
+    print(f"  Evaluating initial fitness for particle {i+1}/{args.num_particles}:")
+    # Evaluate fitness of the initial state z_i
+    fitness = evaluate_fitness_loss(
+        particle['model'].state_dict(), trainloader, criterion, device
+    )
+    particle['current_fitness'] = fitness
+    particle['pbest_fitness'] = fitness # Initial pbest fitness is the initial fitness
+    # pbest_state_dict is already set to the initial state
+
+    # Check if this particle is the best *so far* in this initial eval
+    if fitness < current_epoch_best_fitness:
+        current_epoch_best_fitness = fitness
+        current_epoch_best_particle_idx = i
+
+# Update global best (gbest) based on the initial evaluation
+if current_epoch_best_particle_idx != -1 :
+     initial_best_particle = particles[current_epoch_best_particle_idx]
+     print(f"\nInitial Global Best Fitness (particle {current_epoch_best_particle_idx+1}): {current_epoch_best_fitness:.4f}")
+     gbest_fitness = current_epoch_best_fitness
+     gbest_state_dict = copy.deepcopy(initial_best_particle['pbest_state_dict']) # Use its pbest state
+else:
+     print("\nWarning: No valid fitness found in initial evaluation.")
+     # Fallback: use the originally loaded model as gbest
+     gbest_fitness = evaluate_fitness_loss(initial_model.state_dict(), trainloader, criterion, device)
+     gbest_state_dict = copy.deepcopy(initial_model.state_dict())
+     print(f"Using loaded model as initial gbest (Fitness: {gbest_fitness:.4f})")
+
+
+# -------------------- CNO Main Loop --------------------
+print(f"\n==> Starting CNO Fine-tuning for {args.cno_epochs} epochs...")
+cno_start_time = time.time()
+
+for cno_epoch in range(args.cno_epochs):
+    print(f"\n--- CNO Epoch {cno_epoch + 1}/{args.cno_epochs} ---")
+    epoch_start_time = time.time()
+    current_epoch_best_fitness = float('inf')
+    current_epoch_best_particle_idx = -1
+
+    for i, particle in enumerate(particles):
+        print(f"  Processing Particle {i+1}/{args.num_particles}:")
+
+        # --- Store current state z_i ---
+        z_i_state = copy.deepcopy(particle['model'].state_dict())
+
+        # --- CNO Line 7: Perform SGD step ---
+        # Gets state *after* SGD (z_bar_i) and the loss *during* that SGD run
+        z_bar_i_state, sgd_run_loss = train_one_sgd_epoch_and_get_state(
+            z_i_state, trainloader, criterion, device,
+            args.eta, args.inner_sgd_momentum, args.inner_sgd_wd
+        )
+
+        new_state = copy.deepcopy(z_bar_i_state)
+        particle['model'].load_state_dict(new_state)
+        # --- CNO Line 10: Evaluate Fitness of the *new* position z_i ---
+        current_fitness = evaluate_fitness_loss(
+            particle['model'].state_dict(), trainloader, criterion, device
+        )
+        particle['current_fitness'] = current_fitness
+
+        # --- CNO Lines 11-13: Update PBest ---
+        if current_fitness < particle['pbest_fitness']:
+            print(f"      New pbest for particle {i+1}: {current_fitness:.4f} (was {particle['pbest_fitness']:.4f})")
+            particle['pbest_fitness'] = current_fitness
+            particle['pbest_state_dict'] = copy.deepcopy(particle['model'].state_dict())
+        else:
+            print(f"      Fitness {current_fitness:.4f} not better than pbest {particle['pbest_fitness']:.4f}")
+
+        # Track best particle *in this epoch* based on fitness evaluated at Line 10
+        if current_fitness < current_epoch_best_fitness:
+             current_epoch_best_fitness = current_fitness
+             current_epoch_best_particle_idx = i
+
+        # --- CNO Lines 14-16: Update GBest (after processing all particles) ---
+        print("Updating gbest...")
+        if current_epoch_best_particle_idx != -1 and current_epoch_best_fitness < gbest_fitness:
+            print(f"    New Global Best! Fitness: {current_epoch_best_fitness:.4f} (was {gbest_fitness:.4f}) from particle {current_epoch_best_particle_idx+1}'s pbest")
+            gbest_fitness = current_epoch_best_fitness
+            # Gbest state comes from the pbest state of the particle that achieved the best fitness *in this epoch*
+            gbest_state_dict = copy.deepcopy(particles[current_epoch_best_particle_idx]['pbest_state_dict'])
+        else:
+            print(f"    No new gbest found this epoch. Best this epoch: {current_epoch_best_fitness:.4f}, Current gbest: {gbest_fitness:.4f}")
+
+        epoch_time = time.time() - epoch_start_time
+        print(f"--- CNO Epoch {cno_epoch + 1} finished. Global Best Fitness: {gbest_fitness:.4f} | Time: {epoch_time:.2f}s ---")
+
+        # --- CNO Line 8: Update Velocity ---
+        update_cno_velocity(
+            particle['velocity'],
+            z_bar_i_state,       # State after SGD
+            particle['pbest_state_dict'],
+            gbest_state_dict,
+            args.w, args.c1, args.c2, device
+        )
+
+        # --- CNO Line 9: Update Position ---
+        # Applies z_i + v_i to the particle's model
+        update_particle_position(
+             particle['model'], # Model to update
+             z_bar_i_state,         # State before SGD (z_i)
+             particle['velocity'], # Newly computed velocity (v_i)
+             device
+        )
+
+        
+
+    
+
+
+total_cno_time = time.time() - cno_start_time
+print(f"\n==> Finished CNO Fine-tuning in {total_cno_time:.2f} seconds ({total_cno_time/3600:.2f} hours).")
+
+# -------------------- Final Evaluation --------------------
+print("\n==> Evaluating the best model found by CNO...")
+# final_best_model = ResNet20().to(device)
+
+if args.arch == 'r18':
+    final_best_model = models.resnet18(pretrained=False, num_classes=1000).to(device)
+if args.arch == 'r34':
+    final_best_model = models.resnet34(pretrained=False, num_classes=1000).to(device)
+if args.arch == 'r50':
+    final_best_model = models.resnet50(pretrained=False, num_classes=1000).to(device)
+
+    
+if gbest_state_dict is not None:
+    final_best_model.load_state_dict(gbest_state_dict)
+else:
+    print("Error: Global best state dictionary was not set. Cannot evaluate.")
+    exit()
+
+
+print("--- Final Training Set Evaluation (using standard evaluate) ---")
+final_train_loss, final_train_acc = evaluate(trainloader, final_best_model, "Train")
+
+print("--- Final Test Set Evaluation (using standard evaluate) ---")
+final_test_loss, final_test_acc = evaluate(testloader, final_best_model, "Test")
+
+
+particle_eval_results = {} # Optional: dictionary to store results per particle
+for i, particle in enumerate(particles):
+    print(f"\n--- Evaluating Final State of Particle {i+1}/{args.num_particles} ---")
+    # The model in particle['model'] holds the final state after all updates
+    particle_model = particle['model']
+
+    # Use standard evaluate for training set
+    print(f"Particle {i+1} Train Set Evaluation:")
+    train_loss, train_acc = evaluate(trainloader, particle_model, f"P{i+1} Train")
+
+    # Use standard evaluate for test set
+    print(f"Particle {i+1} Test  Set Evaluation:") # Added padding for alignment
+    test_loss, test_acc = evaluate(testloader, particle_model, f"P{i+1} Test ")
+
+    particle_eval_results[f'particle_{i+1}'] = {'train_loss': train_loss, 'train_acc': train_acc, 'test_loss': test_loss, 'test_acc': test_acc}
+
+print("\n===== Initial Model Performance =====")
+print(f"Initial Training Loss: {initial_train_loss:.4f}") # From evaluate() at start
+print(f"Initial Training Acc:  {initial_train_acc:.3f}%")
+print(f"Initial Test Loss:     {initial_test_loss:.4f}")
+print(f"Initial Test Acc:      {initial_test_acc:.3f}%")
+print("====================================")
+
+print("\n===== CNO Fine-tuned Model Performance =====")
+print(f"Achieved Global Best Fitness (Min Train Loss during CNO): {gbest_fitness:.4f}")
+print(f"Final Eval Training Loss: {final_train_loss:.4f}") # From evaluate() at end
+print(f"Final Eval Training Acc:  {final_train_acc:.3f}%")
+print(f"Final Eval Test Loss:     {final_test_loss:.4f}")
+print(f"Final Eval Test Acc:      {final_test_acc:.3f}%")
+print("==========================================")
+
+# -------------------- Save Final Model --------------------
+print(f'==> Saving final CNO best model to {args.save_path}')
+save_dir = os.path.dirname(args.save_path)
+if save_dir and not os.path.exists(save_dir):
+    os.makedirs(save_dir)
+if gbest_state_dict is not None:
+    torch.save(gbest_state_dict, args.save_path)
+    print("Final best model saved.")
+else:
+    print("Error: Global best state dictionary was not set. Model not saved.")
