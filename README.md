@@ -10,9 +10,9 @@ Some machine learning tasks that emphasize the generalization property, e.g., a 
 
 Our proposed method, CNOGNP, enhances the generalization of deep learning models by explicitly searching for **flat minima** in the loss landscape. It integrates a gradient norm penalty into the fitness function of the Collaborative Neurodynamic Optimization (CNO) framework.
 
-The core idea is to modify the fitness function `φ(z)` to not only minimize the loss `f(z)` but also its sharpness, which is approximated by the squared L2 norm of the gradient `||∇f(z)||₂²`:
+The core idea is to modify the fitness function `φ(z)` to not only minimize the loss `f(z)` but also its sharpness, which is approximated by the squared L2 norm of the gradient `||∇f(z)||₂`:
 
-`φ(z) = f(z) + λ ||∇f(z)||₂²`
+`φ(z) = f(z) + λ ||∇f(z)||₂`
 
 where `λ` is a hyperparameter balancing the two objectives. This approach leverages the powerful local and global search capabilities of CNO to efficiently converge to flatter regions, which are known to generalize better to unseen data.
 
