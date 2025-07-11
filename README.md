@@ -16,7 +16,7 @@ The core idea is to modify the fitness function `φ(z)` to not only minimize the
 
 where `λ` is a hyperparameter balancing the two objectives. This approach leverages the powerful local and global search capabilities of CNO to efficiently converge to flatter regions, which are known to generalize better to unseen data.
 
-
+![Overview of CNOGNP](overview.png)
 
 Our proposed CNOGNP consistently outperforms baseline and state-of-the-art methods across various datasets and model architectures, demonstrating its superior generalization ability.
 
